@@ -1,113 +1,110 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import sqlite3
+import mysql.connector
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "https://aymandyy.github.io/collab/"}})
 
-# Database setup
-DB_NAME = "students.db"
+# MySQL Connection
+db = mysql.connector.connect(
+    host="localhost",  
+    user="root",       
+    password="gurjot",  
+    database="student_database"
+)
 
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS students (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                age INTEGER NOT NULL,
-                mobile_no TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                qualifications TEXT NOT NULL,
-                skill_set TEXT NOT NULL,
-                institution TEXT NOT NULL,
-                department TEXT NOT NULL,
-                skill_level TEXT NOT NULL CHECK(skill_level IN ('newbee', 'intermediate', 'professional')),
-                left_date TEXT DEFAULT NULL
-            )
-        """)
-        conn.commit()
+cursor = db.cursor()
 
-# Helper function to check the 21-day restriction
+# Helper function to check if a student can participate (21-day restriction)
 def can_participate(email):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT left_date FROM students WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        if not row or not row[0]:
-            return True
-        left_date = datetime.strptime(row[0], "%Y-%m-%d")
-        return datetime.utcnow() - left_date >= timedelta(days=21)
+    cursor.execute("SELECT left_date FROM students WHERE email = %s", (email,))
+    result = cursor.fetchone()
+    if result is None or result[0] is None:
+        return True
+    left_date = result[0]
+    if datetime.utcnow() - left_date >= timedelta(days=21):
+        return True
+    return False
 
-# Add or update student
+# Add or Update a Student
 @app.route('/add-student', methods=['POST'])
 def add_student():
     try:
         data = request.json
         email = data.get("email")
-
+        
         if not can_participate(email):
             return jsonify({"message": "Student is restricted from participating until 21 days have passed."}), 403
-
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO students (name, age, mobile_no, email, qualifications, skill_set, institution, department, skill_level, left_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                ON CONFLICT(email) DO UPDATE SET
-                    name = excluded.name,
-                    age = excluded.age,
-                    mobile_no = excluded.mobile_no,
-                    qualifications = excluded.qualifications,
-                    skill_set = excluded.skill_set,
-                    institution = excluded.institution,
-                    department = excluded.department,
-                    skill_level = excluded.skill_level,
-                    left_date = NULL
-            """, (
-                data["name"],
-                data["age"],
-                data["mobile_no"],
-                data["email"],
-                data["qualifications"],
-                data["skill_set"],
-                data["institution"],
-                data["department"],
-                data["skill_level"]
+        
+        # Check if student exists and update or insert
+        cursor.execute("SELECT * FROM students WHERE email = %s", (email,))
+        existing_student = cursor.fetchone()
+        
+        if existing_student:
+            query = """
+            UPDATE students
+            SET name = %s, age = %s, mobile_no = %s, qualifications = %s, skill_set = %s,
+                school_college_university = %s, department = %s, skill_level = %s, locality = %s
+            WHERE email = %s
+            """
+            cursor.execute(query, (
+                data['name'], data['age'], data['mobile_no'], data['qualifications'], data['skill_set'],
+                data['school_college_university'], data['department'], data['skill_level'], data['locality'],
+                email
             ))
-            conn.commit()
+        else:
+            query = """
+            INSERT INTO students (name, age, mobile_no, email, qualifications, skill_set,
+                                  school_college_university, department, skill_level, locality)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(query, (
+                data['name'], data['age'], data['mobile_no'], data['email'], data['qualifications'],
+                data['skill_set'], data['school_college_university'], data['department'],
+                data['skill_level'], data['locality']
+            ))
 
+        db.commit()
         return jsonify({"message": "Student added/updated successfully!"}), 201
     except Exception as e:
+        db.rollback()
         return jsonify({"message": "Error adding student", "error": str(e)}), 500
 
-# Mark a student as leaving the project
+# Mark Student as Leaving the Project
 @app.route('/leave-project', methods=['POST'])
 def leave_project():
     try:
         email = request.json.get("email")
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE students SET left_date = ? WHERE email = ?", (datetime.utcnow().strftime("%Y-%m-%d"), email))
-            if cursor.rowcount == 0:
-                return jsonify({"message": "Student not found!"}), 404
-            conn.commit()
+        if not email:
+            return jsonify({"message": "Email is required!"}), 400
+
+        # Update the student's leave date
+        cursor.execute("SELECT * FROM students WHERE email = %s", (email,))
+        student = cursor.fetchone()
+        if student is None:
+            return jsonify({"message": "Student not found!"}), 404
+        
+        cursor.execute("UPDATE students SET left_date = %s WHERE email = %s", (datetime.utcnow(), email))
+        db.commit()
         return jsonify({"message": "Student marked as leaving the project!"}), 200
     except Exception as e:
+        db.rollback()
         return jsonify({"message": "Error updating student status", "error": str(e)}), 500
 
 # Fetch all students
 @app.route('/students', methods=['GET'])
 def get_students():
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM students")
-            students = cursor.fetchall()
-            columns = [column[0] for column in cursor.description]
-            result = [dict(zip(columns, row)) for row in students]
-        return jsonify(result), 200
+        cursor.execute("SELECT * FROM students")
+        students = cursor.fetchall()
+        students_list = [{
+            "id": student[0], "name": student[1], "age": student[2], "mobile_no": student[3], "email": student[4],
+            "qualifications": student[5], "skill_set": student[6], "school_college_university": student[7],
+            "department": student[8], "skill_level": student[9], "locality": student[10], "left_date": student[11],
+            "created_at": student[12]
+        } for student in students]
+        return jsonify(students_list), 200
     except Exception as e:
         return jsonify({"message": "Error fetching students", "error": str(e)}), 500
 
@@ -115,18 +112,19 @@ def get_students():
 @app.route('/student/<email>', methods=['GET'])
 def get_student(email):
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM students WHERE email = ?", (email,))
-            row = cursor.fetchone()
-            if not row:
-                return jsonify({"message": "Student not found!"}), 404
-            columns = [column[0] for column in cursor.description]
-            student = dict(zip(columns, row))
-        return jsonify(student), 200
+        cursor.execute("SELECT * FROM students WHERE email = %s", (email,))
+        student = cursor.fetchone()
+        if student is None:
+            return jsonify({"message": "Student not found!"}), 404
+        student_data = {
+            "id": student[0], "name": student[1], "age": student[2], "mobile_no": student[3], "email": student[4],
+            "qualifications": student[5], "skill_set": student[6], "school_college_university": student[7],
+            "department": student[8], "skill_level": student[9], "locality": student[10], "left_date": student[11],
+            "created_at": student[12]
+        }
+        return jsonify(student_data), 200
     except Exception as e:
         return jsonify({"message": "Error fetching student", "error": str(e)}), 500
 
 if __name__ == '__main__':
-    init_db()
     app.run(debug=True, port=5000)
